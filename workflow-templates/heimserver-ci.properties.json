@@ -1,5 +1,0 @@
-{
-  "name": "CI auf dem Heimserver",
-  "description": "Läuft auf dem eigenen Org-Runner, wenn er online ist, sonst auf GitHub.",
-  "categories": ["Automation"]
-}
