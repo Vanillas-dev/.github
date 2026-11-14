@@ -1,0 +1,34 @@
+# Vorlage für neue Repos der Org: Jobs laufen auf dem Heimserver, wenn er online ist,
+# sonst auf GitHub. Die eigentlichen Schritte unter "build" ersetzt du pro Projekt.
+name: CI
+
+on:
+  push:
+    branches: [$default-branch]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runner:
+    uses: Vanillas-dev/.github/.github/workflows/waehle-runner.yml@main
+    secrets: inherit
+
+  build:
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.runs-on) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Wo laufe ich?
+        run: echo "Runner ${{ needs.runner.outputs.ort }}, $(hostname), $(nproc) Kerne"
+      # Hier die Schritte des Projekts, z. B.:
+      # - uses: actions/setup-node@v6
+      #   with: { node-version: 22 }
+      # - run: npm ci && npm test
+
+  # Mehrere Jobs? Jeder bekommt dasselbe Paar:
+  #   needs: runner
+  #   runs-on: ${{ fromJSON(needs.runner.outputs.runs-on) }}
