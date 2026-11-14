@@ -1,0 +1,117 @@
+# Wiederverwendbarer Workflow: entscheidet, ob die Jobs eines Workflows auf dem
+# Heimserver (Org-Runner mit Label "heimserver") oder auf GitHub laufen.
+#
+# GitHub selbst weicht NIE automatisch aus: ein Job mit runs-on: [self-hosted, heimserver]
+# wartet bis zu 24 Stunden in der Warteschlange, wenn der Server aus ist, und wird dann
+# abgebrochen. Deshalb fragt dieser kleine Job (auf GitHub, ca. 10 Sekunden) vorher nach.
+#
+# Aufruf in einem Repo der Org:
+#   jobs:
+#     runner:
+#       uses: Vanillas-dev/.github/.github/workflows/waehle-runner.yml@main
+#       secrets: inherit
+#     build:
+#       needs: runner
+#       runs-on: ${{ fromJSON(needs.runner.outputs.runs-on) }}
+#
+# Reihenfolge der Entscheidung:
+#   1. Pull Request aus einem Fork        -> GitHub (fremder Code nie auf den Server)
+#   2. Öffentliches Repo                  -> GitHub (Runner-Gruppe lässt nur private zu)
+#   3. Datei runner-modus.txt in diesem Repo: "github" oder "heimserver" erzwingt das
+#      für ALLE Repos der Org; "auto" (Standard) geht weiter zu 4.
+#   4. Secret RUNNER_STATUS_TOKEN im aufrufenden Repo vorhanden -> Org-Runner per API
+#      abfragen: einer online -> Heimserver, sonst GitHub.
+#      Kein Secret -> Heimserver ohne Prüfung.
+name: Runner wählen
+
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Label des eigenen Runners
+        type: string
+        default: heimserver
+      fallback:
+        description: GitHub-Runner, wenn der Heimserver nicht geht
+        type: string
+        default: ubuntu-latest
+    secrets:
+      RUNNER_STATUS_TOKEN:
+        description: 'Fine-grained Token der Org mit Self-hosted runners (Read)'
+        required: false
+    outputs:
+      runs-on:
+        description: JSON für runs-on, mit fromJSON() benutzen
+        value: ${{ jobs.waehlen.outputs.runs-on }}
+      ort:
+        description: '"heimserver" oder "github"'
+        value: ${{ jobs.waehlen.outputs.ort }}
+
+permissions:
+  contents: read
+
+jobs:
+  waehlen:
+    name: Runner wählen
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      runs-on: ${{ steps.w.outputs.runs-on }}
+      ort: ${{ steps.w.outputs.ort }}
+    steps:
+      - id: w
+        env:
+          ORG: ${{ github.repository_owner }}
+          LABEL: ${{ inputs.label }}
+          FALLBACK: ${{ inputs.fallback }}
+          FORK_PR: ${{ github.event.pull_request.head.repo.fork == true }}
+          STATUS_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          heim="[\"self-hosted\",\"$LABEL\"]"
+          gh_runner="\"$FALLBACK\""
+
+          waehle() {  # $1 = heimserver|github, $2 = Begründung
+            if [ "$1" = heimserver ]; then wert="$heim"; else wert="$gh_runner"; fi
+            echo "runs-on=$wert" >> "$GITHUB_OUTPUT"
+            echo "ort=$1" >> "$GITHUB_OUTPUT"
+            echo "### Runner: $1" >> "$GITHUB_STEP_SUMMARY"
+            echo "$2" >> "$GITHUB_STEP_SUMMARY"
+            echo "Runner: $1 ($2)"
+            exit 0
+          }
+
+          # 1. Fork-PRs nie auf den eigenen Server.
+          [ "$FORK_PR" = true ] && waehle github "Pull Request aus einem Fork."
+
+          # 2. Öffentliche Repos dürfen den Heimserver nicht benutzen.
+          privat=$(gh api "repos/$GITHUB_REPOSITORY" --jq .private 2>/dev/null || echo true)
+          [ "$privat" = false ] && waehle github "Öffentliches Repo."
+
+          # 3. Globaler Schalter für die ganze Org (Datei in diesem .github-Repo).
+          #    raw.githubusercontent.com cached bis ca. 5 Minuten.
+          modus=$(curl -fsS --max-time 10 \
+            "https://raw.githubusercontent.com/$ORG/.github/main/runner-modus.txt" 2>/dev/null \
+            | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          case "$modus" in
+            github)     waehle github "runner-modus.txt steht auf github." ;;
+            heimserver) waehle heimserver "runner-modus.txt steht auf heimserver." ;;
+          esac
+
+          # 4. Automatisch: ist ein Runner mit dem Label online?
+          if [ -z "$STATUS_TOKEN" ]; then
+            waehle heimserver "Ohne Prüfung (Secret RUNNER_STATUS_TOKEN fehlt im Repo)."
+          fi
+          # Ephemere Runner sind zwischen zwei Jobs ein paar Sekunden weg, darum 3 Versuche.
+          for versuch in 1 2 3; do
+            online=$(GH_TOKEN="$STATUS_TOKEN" gh api "orgs/$ORG/actions/runners?per_page=100" \
+              --jq "[.runners[] | select(.status == \"online\")
+                    | select(any(.labels[]; .name == \"$LABEL\"))] | length") || {
+              echo "::warning::Runner-Status nicht lesbar. Ist RUNNER_STATUS_TOKEN abgelaufen?"
+              waehle heimserver "Status-Abfrage fehlgeschlagen, Heimserver ohne Prüfung."
+            }
+            [ "$online" -gt 0 ] && waehle heimserver "$online Runner online."
+            [ "$versuch" -lt 3 ] && sleep 15
+          done
+          waehle github "Kein Heimserver-Runner online."
